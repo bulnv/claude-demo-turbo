@@ -19,16 +19,27 @@ jobs:
     name: Detect Changed Services
     runs-on: ubuntu-latest
     outputs:
-      user-service: ${{ steps.filter.outputs.user-service }}
-      order-service: ${{ steps.filter.outputs.order-service }}
-      packages: ${{ steps.filter.outputs.packages }}
+      user-service: ${{ steps.result.outputs.user-service }}
+      order-service: ${{ steps.result.outputs.order-service }}
+      packages: ${{ steps.result.outputs.packages }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Check if first commit
+        id: check
+        run: |
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            echo "is_first_commit=false" >> $GITHUB_OUTPUT
+          else
+            echo "is_first_commit=true" >> $GITHUB_OUTPUT
+            echo "First commit detected - all services will be built"
+          fi
+
       - name: Detect changes
+        if: steps.check.outputs.is_first_commit == 'false'
         uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -41,6 +52,19 @@ jobs:
               - 'packages/**'
             packages:
               - 'packages/**'
+
+      - name: Set outputs
+        id: result
+        run: |
+          if [ "${{ steps.check.outputs.is_first_commit }}" == "true" ]; then
+            echo "user-service=true" >> $GITHUB_OUTPUT
+            echo "order-service=true" >> $GITHUB_OUTPUT
+            echo "packages=true" >> $GITHUB_OUTPUT
+          else
+            echo "user-service=${{ steps.filter.outputs.user-service }}" >> $GITHUB_OUTPUT
+            echo "order-service=${{ steps.filter.outputs.order-service }}" >> $GITHUB_OUTPUT
+            echo "packages=${{ steps.filter.outputs.packages }}" >> $GITHUB_OUTPUT
+          fi
 
   build-and-test:
     name: Build & Test
