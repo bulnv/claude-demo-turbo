@@ -85,6 +85,7 @@ jobs:
 
             echo "services=$SERVICES" >> $GITHUB_OUTPUT
             echo "matrix={\"service\":$SERVICES}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Display detected services
         run: |
