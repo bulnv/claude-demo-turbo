@@ -50,7 +50,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -61,14 +61,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Determine turbo filter
+        id: filter
+        run: |
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            echo "filter=--filter='...[HEAD^]'" >> $GITHUB_OUTPUT
+          else
+            echo "filter=" >> $GITHUB_OUTPUT
+            echo "First commit detected - building all packages"
+          fi
+
       - name: Build affected packages
-        run: npx turbo run build --filter='...[HEAD^]'
+        run: npx turbo run build ${{ steps.filter.outputs.filter }}
 
       - name: Run linting
-        run: npx turbo run lint --filter='...[HEAD^]'
+        run: npx turbo run lint ${{ steps.filter.outputs.filter }}
 
       - name: Run tests
-        run: npx turbo run test --filter='...[HEAD^]'
+        run: npx turbo run test ${{ steps.filter.outputs.filter }}
 
   build-user-service:
     name: Build user-service Docker
