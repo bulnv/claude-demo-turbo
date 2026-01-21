@@ -1,0 +1,308 @@
+name: Release & Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to release (or "all" for changed services)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - user-service
+          - order-service
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}
+
+jobs:
+  detect-services:
+    name: Detect Services to Release
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect services to release
+        id: detect
+        run: |
+          if [ "${{ inputs.service }}" != "all" ]; then
+            echo "services=[\"${{ inputs.service }}\"]" >> $GITHUB_OUTPUT
+            echo "matrix={\"service\":[\"${{ inputs.service }}\"]}" >> $GITHUB_OUTPUT
+          else
+            # Get changed files since last release tag
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+            if [ -z "$LAST_TAG" ]; then
+              CHANGED_FILES=$(git diff --name-only HEAD~10 HEAD 2>/dev/null || git ls-files)
+            else
+              CHANGED_FILES=$(git diff --name-only $LAST_TAG HEAD)
+            fi
+
+            SERVICES="[]"
+
+            if echo "$CHANGED_FILES" | grep -q "apps/user-service/"; then
+              SERVICES=$(echo "$SERVICES" | jq -c '. + ["user-service"]')
+            fi
+
+            if echo "$CHANGED_FILES" | grep -q "apps/order-service/"; then
+              SERVICES=$(echo "$SERVICES" | jq -c '. + ["order-service"]')
+            fi
+
+            # If packages changed, release all services
+            if echo "$CHANGED_FILES" | grep -q "packages/"; then
+              SERVICES='["user-service","order-service"]'
+            fi
+
+            # Default to all if nothing detected
+            if [ "$SERVICES" == "[]" ]; then
+              SERVICES='["user-service","order-service"]'
+            fi
+
+            echo "services=$SERVICES" >> $GITHUB_OUTPUT
+            echo "matrix={\"service\":$SERVICES}" >> $GITHUB_OUTPUT
+
+      - name: Display detected services
+        run: |
+          echo "Services to release: ${{ steps.detect.outputs.services }}"
+
+  release:
+    name: Release ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: detect-services
+    if: needs.detect-services.outputs.services != '[]'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-services.outputs.matrix) }}
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      user-service-version: ${{ steps.version.outputs.user-service-version }}
+      order-service-version: ${{ steps.version.outputs.order-service-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Get current version
+        id: current
+        run: |
+          VERSION=$(node -p "require('./apps/${{ matrix.service }}/package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Current version of ${{ matrix.service }}: $VERSION"
+
+      - name: Bump version
+        id: version
+        run: |
+          cd apps/${{ matrix.service }}
+
+          CURRENT="${{ steps.current.outputs.version }}"
+          IFS='.' read -ra VERSION_PARTS <<< "$CURRENT"
+          MAJOR=${VERSION_PARTS[0]}
+          MINOR=${VERSION_PARTS[1]}
+          PATCH=${VERSION_PARTS[2]}
+
+          case "${{ inputs.version_bump }}" in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "${{ matrix.service }}-version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+          # Update package.json
+          npm version $NEW_VERSION --no-git-tag-version
+
+          echo "New version: $NEW_VERSION"
+
+      - name: Build service
+        run: npx turbo run build --filter=@repo/${{ matrix.service }}
+
+      - name: Run tests
+        run: npx turbo run test --filter=@repo/${{ matrix.service }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit version bump
+        run: |
+          git add apps/${{ matrix.service }}/package.json
+          git commit -m "chore(${{ matrix.service }}): bump version to ${{ steps.version.outputs.new_version }}" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.new_version }}
+            type=raw,value=latest,enable=${{ inputs.environment == 'production' }}
+            type=sha,prefix=
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./apps/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          SERVICE="${{ matrix.service }}"
+          PREV_TAG=$(git tag -l "${SERVICE}-*" --sort=-v:refname | head -n 1)
+
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline --no-merges -- "apps/$SERVICE" | head -20)
+          else
+            COMMITS=$(git log --oneline --no-merges ${PREV_TAG}..HEAD -- "apps/$SERVICE")
+          fi
+
+          if [ -z "$COMMITS" ]; then
+            COMMITS="- Initial release or no specific changes"
+          fi
+
+          # Create changelog content
+          CHANGELOG="## What's Changed in $SERVICE v${{ steps.version.outputs.new_version }}
+
+          ### Commits
+          $COMMITS
+
+          ### Docker Image
+          \`\`\`
+          ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.version.outputs.new_version }}
+          \`\`\`
+
+          ### Deployment
+          - Environment: ${{ inputs.environment }}
+          - Triggered by: @${{ github.actor }}"
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.service }}-v${{ steps.version.outputs.new_version }}
+          name: "${{ matrix.service }} v${{ steps.version.outputs.new_version }}"
+          body: ${{ steps.changelog.outputs.changelog }}
+          draft: false
+          prerelease: ${{ inputs.environment == 'staging' }}
+          generate_release_notes: false
+
+  deploy:
+    name: Deploy ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [detect-services, release]
+    if: needs.detect-services.outputs.services != '[]'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-services.outputs.matrix) }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get deployed version
+        id: deployed
+        run: |
+          VERSION=$(node -p "require('./apps/${{ matrix.service }}/package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Deploy notification
+        run: |
+          echo "=========================================="
+          echo "Deploying ${{ matrix.service }}"
+          echo "=========================================="
+          echo "Version: ${{ steps.deployed.outputs.version }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.deployed.outputs.version }}"
+          echo ""
+          echo "Add your deployment logic here:"
+          echo "- kubectl apply / helm upgrade"
+          echo "- AWS ECS update-service"
+          echo "- Cloud Run deploy"
+          echo "- etc."
+
+      # Example: Deploy to Kubernetes (uncomment and configure)
+      # - name: Deploy to Kubernetes
+      #   run: |
+      #     kubectl set image deployment/${{ matrix.service }} \
+      #       ${{ matrix.service }}=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.deployed.outputs.version }} \
+      #       --namespace=${{ inputs.environment }}
+
+      - name: Deployment summary
+        run: |
+          echo "### Deployment Complete :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ matrix.service }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ steps.deployed.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.deployed.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
